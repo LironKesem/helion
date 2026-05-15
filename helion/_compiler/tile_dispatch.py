@@ -13,8 +13,6 @@ from .device_ir import ForLoopGraphInfo
 from .device_ir import ReductionLoopGraphInfo
 from .device_ir import RootGraphInfo
 from .host_function import HostFunction
-from .reduction_strategy import LoopedReductionStrategy
-from .reduction_strategy import PersistentReductionStrategy
 from .reduction_strategy import ReductionStrategy
 from .tile_strategy import CompactedShape
 from .tile_strategy import DeviceLoopState
@@ -98,6 +96,11 @@ class TileStrategyDispatch:
         self.block_id_to_strategy[tuple(block_ids)] = strategy
 
     def _add_reduction_strategies(self, fn: DeviceFunction, config: Config) -> None:
+        # Make the dispatcher (with tile strategies already registered)
+        # visible to reduction-strategy __init__ via ``fn.tile_strategy``
+        # so reductions can shrink their thread count if total launch
+        # threads would otherwise exceed the per-block limit.
+        fn.tile_strategy = self
         env = CompileEnvironment.current()
         max_threads = env.backend.max_reduction_threads()
         rdims = [bs.block_id for bs in env.block_sizes if bs.reduction]
@@ -125,10 +128,9 @@ class TileStrategyDispatch:
                         reduction_loop = max_threads
                 elif reduction_loop > max_threads:
                     reduction_loop = max_threads
-            if reduction_loop is None:
-                strategy: TileStrategy = PersistentReductionStrategy(fn, block_id)
-            else:
-                strategy = LoopedReductionStrategy(fn, block_id, reduction_loop)
+            strategy = env.backend.create_reduction_strategy(
+                fn, block_id, reduction_loop
+            )
             self._register_strategy([block_id], strategy)
 
     def codegen_grid(self, state: CodegenState, block_ids: list[int]) -> None:

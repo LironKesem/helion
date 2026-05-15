@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from .kernel import BoundKernel
 
     _T = TypeVar("_T")
+    ConfigLike = Config | dict[str, object]
 
     class AutotunerFunction(Protocol):
         def __call__(
@@ -379,6 +380,16 @@ class _Settings:
             _env_get_int, "HELION_AUTOTUNE_COMPILE_TIMEOUT", 60
         )
     )
+    autotune_benchmark_subprocess: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_AUTOTUNE_BENCHMARK_SUBPROCESS", True
+        )
+    )
+    autotune_benchmark_timeout: int = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_int, "HELION_AUTOTUNE_BENCHMARK_TIMEOUT", 30
+        )
+    )
     autotune_precompile: PrecompileMode = dataclasses.field(
         default_factory=functools.partial(
             _env_get_literal,
@@ -412,6 +423,12 @@ class _Settings:
             "HELION_REBENCHMARK_THRESHOLD",
         )
     )
+    autotune_suspicious_rebenchmark_ratio: float | None = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_optional_float,
+            "HELION_AUTOTUNE_SUSPICIOUS_REBENCHMARK_RATIO",
+        )
+    )
     autotune_search_acf: list[str] = dataclasses.field(
         default_factory=functools.partial(
             _env_get_str_list, "HELION_AUTOTUNE_SEARCH_ACF"
@@ -426,6 +443,12 @@ class _Settings:
         default_factory=functools.partial(
             _env_get_optional_int,
             "HELION_AUTOTUNE_MAX_GENERATIONS",
+        )
+    )
+    autotune_budget_seconds: int | None = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_optional_int,
+            "HELION_AUTOTUNE_BUDGET_SECONDS",
         )
     )
     autotune_ignore_errors: bool = dataclasses.field(
@@ -456,6 +479,12 @@ class _Settings:
     )
     autotune_config_overrides: dict[str, object] = dataclasses.field(
         default_factory=_get_autotune_config_overrides
+    )
+    autotune_seed_configs: ConfigLike | Sequence[ConfigLike] | None = None
+    disable_autotuner_heuristics: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_DISABLE_AUTOTUNER_HEURISTICS", False
+        )
     )
     autotune_effort: AutotuneEffort = dataclasses.field(
         default_factory=functools.partial(
@@ -557,14 +586,24 @@ class Settings(_Settings):
             "/tmp/run.csv and /tmp/run.log with per-config metrics and debug logs."
         ),
         "autotune_compile_timeout": "Timeout for Triton compilation in seconds used for autotuning. Default is 60 seconds.",
+        "autotune_benchmark_subprocess": "Run the autotune benchmark phase in a long-lived spawn subprocess so a hung/slow kernel can be killed without losing autotune progress. Enabled by default. Set HELION_AUTOTUNE_BENCHMARK_SUBPROCESS=0 to disable.",
+        "autotune_benchmark_timeout": "Per-config wall-clock timeout in seconds for the subprocess benchmark phase. Only applies when autotune_benchmark_subprocess is enabled. Default 30 seconds.",
         "autotune_precompile": "Autotuner precompile mode: 'fork', 'spawn', or falsy/None to disable. Defaults to 'fork' on non-Windows platforms.",
         "autotune_precompile_jobs": "Maximum concurrent Triton precompile processes, default to cpu count.",
         "autotune_random_seed": "Seed used for autotuner random number generation. Defaults to HELION_AUTOTUNE_RANDOM_SEED or a time-based seed.",
         "autotune_accuracy_check": "If True, validate candidate configs against the baseline kernel output before accepting them during autotuning.",
         "autotune_rebenchmark_threshold": "If a config is within threshold*best_perf, re-benchmark it to avoid outliers. Defaults to effort profile value. Set HELION_REBENCHMARK_THRESHOLD to override.",
+        "autotune_suspicious_rebenchmark_ratio": "When subprocess benchmarking is enabled, recheck rebenchmark timings below ratio*previous_timing before accepting them. Defaults to 0.9. Set HELION_AUTOTUNE_SUSPICIOUS_REBENCHMARK_RATIO=0 to disable.",
         "autotune_search_acf": "List of PTXAS Advanced Controls Files (ACFs) to search during autotuning. ACFs are highly specialized configurations for specific hardware and use cases; when autotuning with ACFs, default -O3 is always considered. Empty list disables.",
         "autotune_progress_bar": "If True, show progress bar during autotuning. Default is True. Set HELION_AUTOTUNE_PROGRESS_BAR=0 to disable.",
         "autotune_max_generations": "Override the maximum number of generations for Pattern Search and Differential Evolution Search autotuning algorithms with HELION_AUTOTUNE_MAX_GENERATIONS=N or @helion.kernel(autotune_max_generations=N).",
+        "autotune_budget_seconds": (
+            "Wall-clock budget in seconds for the entire autotune. When the "
+            "budget is exceeded the search returns the best config found so "
+            "far. Set with HELION_AUTOTUNE_BUDGET_SECONDS=N or "
+            "@helion.kernel(autotune_budget_seconds=N). Default None "
+            "(no budget)."
+        ),
         "autotune_ignore_errors": (
             "If True, skip logging and raising autotune errors. "
             "Set HELION_AUTOTUNE_IGNORE_ERRORS=1 to enable globally."
@@ -589,6 +628,15 @@ class Settings(_Settings):
         "autotune_config_overrides": (
             "Dictionary of config key/value pairs forced during autotuning. "
             "Accepts HELION_AUTOTUNE_CONFIG_OVERRIDES='{\"num_warps\":4}'."
+        ),
+        "autotune_seed_configs": (
+            "A Config or sequence of Configs to seed the autotuner initial population "
+            "without constraining the search space."
+        ),
+        "disable_autotuner_heuristics": (
+            "If True, disable compiler/autotuner heuristics such as compiler seed "
+            "configs. User-provided autotune_seed_configs are unaffected. "
+            "Set HELION_DISABLE_AUTOTUNER_HEURISTICS=1 to disable globally."
         ),
         "allow_warp_specialize": "If True, allow warp specialization for tl.range calls on CUDA devices.",
         "debug_dtype_asserts": "If True, emit tl.static_assert checks for dtype after each device node.",
@@ -637,7 +685,8 @@ class Settings(_Settings):
             "If None (default), uses the built-in benchmark function."
         ),
         "autotune_best_available_max_configs": (
-            "Maximum number of cached configs to use for FROM_BEST_AVAILABLE initial population strategy. "
+            "Maximum number of cached configs to use for FROM_BEST_AVAILABLE initial population "
+            "and for helion.from_cache() warm-start in FiniteSearch. "
             "Set HELION_BEST_AVAILABLE_MAX_CONFIGS=N to override. Default is 20."
         ),
         "autotune_best_available_max_cache_scan": (
@@ -730,6 +779,13 @@ class Settings(_Settings):
             return self.autotune_rebenchmark_threshold
 
         return get_effort_profile(self.autotune_effort).rebenchmark_threshold
+
+    def get_suspicious_rebenchmark_ratio(self) -> float | None:
+        if self.autotune_suspicious_rebenchmark_ratio is not None:
+            return self.autotune_suspicious_rebenchmark_ratio
+        if self.autotune_benchmark_subprocess:
+            return 0.9
+        return None
 
     def _check_ref_eager_mode_before_print_output_code(self) -> None:
         """

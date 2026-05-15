@@ -160,7 +160,7 @@ class TestLLMGuidedSearch(TestCase):
                 self.assertEqual(context[1]["content"], "initial")
                 self.assertEqual(len(context), expected_len)
 
-    @onlyBackends(["triton"])
+    @onlyBackends(["triton", "cute"])
     def test_autotune_runs_full_llm_guided_loop_with_mocked_provider(self):
         """LLM-guided search runs the public round loop with mocked LLM and benchmark backends."""
         import concurrent.futures
@@ -190,6 +190,9 @@ class TestLLMGuidedSearch(TestCase):
 
             def cleanup(self) -> None:
                 self.cleanup_called = True
+
+            def set_budget_exceeded_fn(self, fn) -> None:
+                pass
 
         args = (
             torch.randn([128, 128], device=DEVICE, dtype=torch.float16),
@@ -661,6 +664,9 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
             def __init__(self, **kwargs) -> None:
                 self.kwargs = kwargs
 
+            def set_budget_exceeded_fn(self, fn) -> None:
+                pass
+
         class FakeLLMSearch:
             def __init__(self, kernel, args, **kwargs) -> None:
                 self.kernel = kernel
@@ -758,7 +764,7 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
             search.hybrid_stage_breakdown["second_stage_configs_tested"], 11
         )
 
-    @onlyBackends(["triton"])
+    @onlyBackends(["triton", "cute"])
     def test_autotune_runs_full_hybrid_loop_with_mocked_stages(self):
         """The public hybrid autotune entrypoint runs both stages and returns stage-2 best."""
         from helion.autotuner import InitialPopulationStrategy
@@ -790,6 +796,9 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
 
             def cleanup(self) -> None:
                 self.cleanup_called = True
+
+            def set_budget_exceeded_fn(self, fn) -> None:
+                pass
 
         class FakeLLMSearch:
             def __init__(self, kernel, args, **kwargs) -> None:
@@ -896,6 +905,9 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
         class FakeBenchmarkProvider:
             def __init__(self, **kwargs) -> None:
                 self.kwargs = kwargs
+
+            def set_budget_exceeded_fn(self, fn) -> None:
+                pass
 
         class FailIfLLMConstructed:
             def __init__(self, *args, **kwargs) -> None:

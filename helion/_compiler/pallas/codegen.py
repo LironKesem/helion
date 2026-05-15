@@ -7,8 +7,128 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from helion._compiler.ast_extension import expr_from_string
+
 if TYPE_CHECKING:
     from helion._compiler.inductor_lowering import CodegenState
+
+
+def load_expr(
+    state: CodegenState,
+    subscript: list[object],
+    tensor: torch.Tensor,
+) -> ast.AST:
+    """Pallas load codegen: normal path, or indirect gather if ``plan_tiling`` flagged it."""
+    from helion._compiler.pallas.gather import emit_gather
+    from helion._compiler.pallas.plan_tiling import IndirectGatherPattern
+
+    name = state.device_function.tensor_arg(tensor).name
+    name = vmem_name(state, name)
+    device_fn = state.device_function
+    device_fn.device_load_index += 1
+    device_fn.device_memory_op_index += 1
+
+    assert state.fx_node is not None
+    patterns = state.fx_node.meta.get("indexing_patterns") or ()
+    for pattern in patterns:
+        if isinstance(pattern, IndirectGatherPattern):
+            return emit_gather(state, pattern.plan, name)
+
+    idx_str, none_dims = index_str(state, subscript, tensor)
+    mask_expr = _load_mask_expr(state, subscript, tensor)
+    if mask_expr is not None:
+        result = expr_from_string(f"{name}[{idx_str}] * ({mask_expr})")
+    else:
+        result = expr_from_string(f"{name}[{idx_str}]")
+    for dim in none_dims:
+        result = expr_from_string(
+            f"jnp.expand_dims({{result}}, axis={dim})", result=result
+        )
+    return result
+
+
+def _load_mask_expr(
+    state: CodegenState,
+    subscript: list[object],
+    tensor: torch.Tensor,
+) -> str | None:
+    """Build a mask expression for a Pallas load to zero out-of-bounds data.
+
+    Iterates over the indexing patterns for this load.  For each TilePattern
+    whose loop range does not match the tensor's dimension size (e.g.
+    data-dependent bounds, constexpr sub-ranges), generates a mask term so
+    that out-of-tile positions are zeroed.
+
+    Only applies to dimensions that are ds-padded (the ref is padded to a
+    multiple of block_size).  Grid/tile dimensions where BlockSpecs size the
+    ref to the actual remainder are not masked — a block-sized mask would
+    cause a shape mismatch against the smaller ref.
+    """
+    from helion._compiler.compile_environment import CompileEnvironment
+    from helion._compiler.pallas.plan_tiling import TilePattern
+
+    assert state.fx_node is not None
+    output_val = state.fx_node.meta.get("val")
+    if not isinstance(output_val, torch.Tensor):
+        return None
+
+    indexing_patterns = _get_indexing_patterns(state, tensor)
+    env = CompileEnvironment.current()
+    output_sizes = [*output_val.size()]
+    mask_exprs: list[str] = []
+    dtype_str: str | None = None
+    out_dim = 0
+    tensor_dim = 0
+
+    for idx, pattern in zip(subscript, indexing_patterns, strict=True):
+        if idx is None:
+            out_dim += 1
+            continue
+
+        if isinstance(pattern, TilePattern):
+            block_id = pattern.block_id
+            if _tile_needs_mask(state, block_id, tensor, tensor_dim):
+                mask_var = state.codegen.mask_var(block_id)
+                if mask_var is not None:
+                    if dtype_str is None:
+                        dtype_str = env.backend.dtype_str(tensor.dtype)
+                    expand = state.tile_strategy.expand_str(output_sizes, out_dim)
+                    expr = f"({mask_var}.astype({dtype_str}){expand})"
+                    mask_exprs.append(expr)
+
+        # TODO(dunfanlu): Do other patterns beside TilePattern require masking?
+
+        out_dim += 1
+        tensor_dim += 1
+
+    if not mask_exprs:
+        return None
+    return "*".join(mask_exprs)
+
+
+def _tile_needs_mask(
+    state: CodegenState,
+    block_id: int,
+    tensor: torch.Tensor,
+    tensor_dim: int,
+) -> bool:
+    """Return True when a TilePattern dimension needs load-time masking.
+
+    A mask is needed when the tile loop's iteration range does not cover the
+    full tensor dimension — i.e. the loop end differs from the tensor's
+    symbolic size at *tensor_dim*.  This includes data-dependent bounds and
+    constexpr sub-ranges.
+    """
+    loops = state.codegen.active_device_loops.get(block_id)
+    if not loops:
+        return False
+    info = loops[-1].block_id_to_info.get(block_id)
+    if info is None:
+        return False
+    dim_size = tensor.shape[tensor_dim]
+    if not info.is_end_matching(dim_size):
+        return True
+    return info.begin_expr is not None and info.begin_expr != 0
 
 
 def _can_tile_dimension(state: CodegenState, tensor_dim: int) -> bool:
@@ -53,15 +173,19 @@ def index_str(
     if not subscript:
         return "...", []
 
-    # Check if we're inside an emit_pipeline or fori_loop with DMA.
-    # When fori_loop runs without DMA (use_dma=False), its block_ids
-    # are NOT treated as pipeline dims — they get pl.ds() slicing instead.
+    # Check if we're inside an emit_pipeline or fori_loop that pipelines
+    # this specific tensor.  Both loop types take a per-tensor decision:
+    # only tensors present in the loop's _tensor_to_dma_scratch mapping were
+    # routed through the inner DMA / Buffered BlockSpec.  Others stay on
+    # their outer BlockSpec and fall through to pl.ds().
+    tensor_name = state.codegen.device_function.tensor_arg(tensor).name
     in_pipeline = False
     pipeline_block_ids: set[int] = set()
     for loops in state.codegen.active_device_loops.values():
         for loop in loops:
-            if isinstance(loop, EmitPipelineLoopState) or (
-                isinstance(loop, ForiLoopState) and loop.use_dma
+            if (
+                isinstance(loop, (EmitPipelineLoopState, ForiLoopState))
+                and tensor_name in loop._tensor_to_dma_scratch
             ):
                 in_pipeline = True
                 pipeline_block_ids.update(loop.block_ids)
@@ -120,11 +244,11 @@ def _generated_index_code(
 
     if isinstance(pattern, TilePattern):
         return _tile_pattern_code(
-            pattern, idx, state, tensor_dim, in_pipeline, pipeline_block_ids
+            pattern, idx, state, tensor, tensor_dim, in_pipeline, pipeline_block_ids
         )
 
     if isinstance(pattern, TileIndexWithOffsetPattern):
-        return _tile_index_with_offset_pattern_code(pattern, state)
+        return _tile_index_with_offset_pattern_code(pattern, state, tensor, tensor_dim)
 
     if isinstance(pattern, TileBeginWithOffsetPattern):
         return _tile_begin_with_offset_pattern_code(
@@ -150,12 +274,14 @@ def _tile_pattern_code(
     pattern: object,
     idx: object,
     state: CodegenState,
+    tensor: torch.Tensor,
     tensor_dim: int,
     in_pipeline: bool,
     pipeline_block_ids: set[int],
 ) -> str:
     from helion._compiler.pallas.plan_tiling import TilePattern
     from helion._compiler.tile_strategy import DeviceLoopState
+    from helion._compiler.tile_strategy import EmitPipelineLoopState
     from helion._compiler.tile_strategy import ForiLoopState
 
     assert isinstance(pattern, TilePattern)
@@ -168,26 +294,30 @@ def _tile_pattern_code(
     # TODO(yifeixu): the long-term fix is making ``can_tile`` per-loop-scope
     # instead of per-tensor-dim so the planner doesn't mark this dim
     # untileable in pipeline mode in the first place.
-    if in_pipeline and block_id in pipeline_block_ids:
+    if in_pipeline:
         return ":"
 
     can_tile = _can_tile_dimension(state, tensor_dim)
     if not can_tile:
-        return _ds_expr(state, block_id)
+        return _ds_expr(state, block_id, tensor=tensor, tensor_dim=tensor_dim)
 
+    # Non-pipelined inner-loop tensors: a pipeline/fori loop exists over
+    # this block_id but this specific tensor was left on its outer
+    # BlockSpec, so the kernel must slice it in VMEM with pl.ds().
     loops = state.codegen.active_device_loops.get(block_id)
     if loops and any(
-        isinstance(loop, DeviceLoopState)
-        or (isinstance(loop, ForiLoopState) and not loop.use_dma)
+        isinstance(loop, (DeviceLoopState, EmitPipelineLoopState, ForiLoopState))
         for loop in loops
     ):
-        return _ds_expr(state, block_id)
+        return _ds_expr(state, block_id, tensor=tensor, tensor_dim=tensor_dim)
     return ":"
 
 
 def _tile_index_with_offset_pattern_code(
     pattern: object,
     state: CodegenState,
+    tensor: torch.Tensor,
+    tensor_dim: int,
 ) -> str:
     from helion._compiler.pallas.plan_tiling import TileIndexWithOffsetPattern
 
@@ -195,7 +325,7 @@ def _tile_index_with_offset_pattern_code(
 
     block_id = pattern.block_id
     offset_str = state.device_function.literal_expr(pattern.offset)
-    return _ds_expr(state, block_id, offset_str)
+    return _ds_expr(state, block_id, offset_str, tensor=tensor, tensor_dim=tensor_dim)
 
 
 def _tile_begin_with_offset_pattern_code(
@@ -258,21 +388,121 @@ def _slice_code(
     if block_id is not None:
         loops = state.codegen.active_device_loops.get(block_id)
         if loops and any(isinstance(loop, DeviceLoopState) for loop in loops):
-            if block_id is not None:
-                return _ds_expr(state, block_id)
+            return _ds_expr(state, block_id, tensor=tensor, tensor_dim=tensor_dim)
 
     return ":"
 
 
-def _ds_expr(state: CodegenState, block_id: int, tile_offset: str = "") -> str:
-    """Return a ``pl.ds(offset, block_size)`` expression for *block_id*, offset by *tile_offset*"""
+def _ds_expr(
+    state: CodegenState,
+    block_id: int,
+    tile_offset: str = "",
+    *,
+    tensor: torch.Tensor | None = None,
+    tensor_dim: int | None = None,
+) -> str:
+    """Return a ``pl.ds(offset, block_size)`` expression for *block_id*, offset by *tile_offset*.
+
+    When *tensor* and *tensor_dim* are provided, records the dimension in
+    ``pallas_pad_info`` so the launcher can zero-pad non-divisible dims.
+    """
     offset = state.codegen.offset_var(block_id)
     if tile_offset:
         offset = f"{offset} + {tile_offset}"
     block_size = state.device_function.block_size_var(block_id)
     if block_size is None:
         return ":"
+    if tensor is not None and tensor_dim is not None:
+        from helion.language.memory_ops import _record_pad_info
+
+        extra_pad = _loop_begin_extra_pad(block_id, state)
+        _record_pad_info(state, tensor, tensor_dim, block_id, extra_pad)
+
+        # Skip when tile_offset is set (e.g. offset + 64) — the shift
+        # means the full expression may not be a multiple of block_size.
+        if not tile_offset:
+            alignment = _loop_offset_alignment(block_id, state)
+            if alignment is not None:
+                # Workaround for JAX <= 0.10.0 where AssumeMultipleOp
+                # short-circuits divisibility analysis (fixed in
+                # jax-ml/jax@33c38f50b): only apply when alignment meets
+                # Mosaic's requirement, otherwise the hint could replace
+                # a stronger proof Mosaic already has.
+                from helion._compiler.backend import PallasBackend
+                from helion._compiler.compile_environment import CompileEnvironment
+
+                backend = CompileEnvironment.current().backend
+                assert isinstance(backend, PallasBackend)
+                dim_from_end = tensor.ndim - 1 - tensor_dim
+                bitwidth = tensor.dtype.itemsize * 8
+                required = backend._get_pallas_required_alignment(
+                    dim_from_end, tensor.ndim, bitwidth
+                )
+                if alignment % required == 0:
+                    # e.g. pl.ds(pl.multiple_of(offset_3, _BLOCK_SIZE_3), _BLOCK_SIZE_3)
+                    offset = f"pl.multiple_of({offset}, {block_size})"
+
     return f"pl.ds({offset}, {block_size})"
+
+
+def _loop_begin_extra_pad(block_id: int, state: CodegenState) -> int:
+    """Return extra padding needed for a non-zero loop begin.
+
+    A ``pl.ds(offset, block_size)`` read starting at a non-zero begin can
+    overshoot the tensor boundary by up to ``begin % block_size`` elements
+    beyond what ``(-N) % block_size`` accounts for.  Returns 0 when the
+    loop starts at 0, ``begin % block_size`` for a provably constant begin,
+    or ``block_size - 1`` for a data-dependent begin.
+    """
+    import sympy
+
+    bs_value = state.device_function.resolved_block_size(block_id)
+    if not isinstance(bs_value, int):
+        return 0
+
+    loops = state.codegen.active_device_loops.get(block_id)
+    if not loops:
+        return 0
+
+    info = loops[-1].block_id_to_info.get(block_id)
+    if info is None or info.begin_expr is None:
+        return 0
+
+    begin = info.begin_expr
+    if isinstance(begin, (int, sympy.Integer)):
+        return int(begin) % bs_value
+
+    return bs_value - 1
+
+
+def _loop_offset_alignment(
+    block_id: int,
+    state: CodegenState,
+) -> int | None:
+    """Return the proven alignment of a loop's offset for *block_id*, or ``None``.
+
+    A loop with step ``block_size`` produces offsets ``begin + i * block_size``,
+    which are multiples of ``block_size`` iff ``begin`` is.  Returns
+    ``block_size`` (int) when provable, ``None`` otherwise.
+    """
+    import sympy
+
+    bs_value = state.device_function.resolved_block_size(block_id)
+    if not isinstance(bs_value, int):
+        return None
+
+    # Check that the loop begins at a multiple of block_size.
+    loops = state.codegen.active_device_loops.get(block_id)
+    if loops:
+        info = loops[-1].block_id_to_info.get(block_id)
+        if info is not None and info.begin_expr is not None:
+            begin = info.begin_expr
+            if not isinstance(begin, (int, sympy.Integer)):
+                return None  # symbolic begin — can't prove alignment
+            if int(begin) % bs_value != 0:
+                return None
+
+    return bs_value
 
 
 def vmem_name(state: CodegenState, name: str) -> str:
@@ -283,7 +513,7 @@ def vmem_name(state: CodegenState, name: str) -> str:
     for loops in state.codegen.active_device_loops.values():
         for loop in loops:
             if isinstance(loop, (EmitPipelineLoopState, ForiLoopState)):
-                mapping = getattr(loop, "_tensor_to_vmem", None)
+                mapping = getattr(loop, "_tensor_to_dma_scratch", None)
                 if mapping and name in mapping:
                     return mapping[name]
     return name

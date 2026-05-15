@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from ..device_ir import GraphInfo
     from ..host_function import SymbolOrigin
     from ..tile_dispatch import TileStrategyDispatch
+    from .gather import GatherPlan
 
 
 @dataclass
@@ -65,6 +66,18 @@ class NonePattern(IndexingPattern):
 
 
 @dataclass
+class TensorIndexPattern(IndexingPattern):
+    """Tensor-valued index - no tiling. Resolved to IndirectGatherPattern for loads, rejected for stores."""
+
+
+@dataclass
+class IndirectGatherPattern(IndexingPattern):
+    """Indirect gather load ``table[idx, ...]`` - no tiling on this dim."""
+
+    plan: GatherPlan
+
+
+@dataclass
 class DimensionTiling:
     """Tiling decision for a specific dimension of a tensor
 
@@ -86,24 +99,14 @@ def plan_tiling(
 
 
 def _analyze_indexing_expressions(graph_info: GraphInfo, config: Config) -> None:
-    from ...language import atomic_ops
     from ...language import memory_ops
+    from ...language.atomic_ops import ATOMIC_OPS
 
+    indexing_targets = ATOMIC_OPS | {memory_ops.load, memory_ops.store}
     for node in graph_info.graph.nodes:
         if node.op != "call_function":
             continue
-        if node.target in (
-            memory_ops.load,
-            memory_ops.store,
-            atomic_ops.atomic_add,
-            atomic_ops.atomic_cas,
-            atomic_ops.atomic_or,
-            atomic_ops.atomic_xor,
-            atomic_ops.atomic_xchg,
-            atomic_ops.atomic_min,
-            atomic_ops.atomic_max,
-            atomic_ops.atomic_and,
-        ):
+        if node.target in indexing_targets:
             _analyze_indexing(node, config)
 
 
@@ -128,6 +131,9 @@ def _analyze_indexing(node: torch.fx.Node, config: Config) -> None:
     # Store indexing patterns directly on the memory operation node
     indexing_patterns = _analyze_subscript_patterns(
         tensor_val, list(subscript), dim_tilings, node, config
+    )
+    _resolve_tensor_index_patterns(
+        node, tensor_val, list(subscript), indexing_patterns, config
     )
     node.meta["indexing_patterns"] = indexing_patterns
 
@@ -237,6 +243,10 @@ def _detect_indexing_pattern(
                 block_id=tile_begin_with_offset.block_id,
                 offset=tile_begin_with_offset.offset,
             )
+        # A tensor-valued index that didn't match any arithmetic-of-tile
+        # pattern is an indirect gather (e.g. table[idx, :]).
+        if isinstance(idx_val, torch.Tensor):
+            return TensorIndexPattern()
         # Indices produced by other FX nodes, such as indices[tile] used in
         # tensor-indexed atomics, are legal but cannot participate in Pallas
         # tiling.
@@ -299,7 +309,7 @@ def _update_tiling_decision(
             # fow now we only support the `[:]` slice pattern
             _disallow_tiling()
 
-    elif isinstance(pattern, ArbitraryIndexPattern):
+    elif isinstance(pattern, (ArbitraryIndexPattern, TensorIndexPattern)):
         _disallow_tiling()
 
     elif isinstance(pattern, NonePattern):
@@ -326,6 +336,75 @@ def _update_tiling_decision(
                 and block_size % required_alignment != 0
             ):
                 _disallow_tiling()
+
+
+def resident_block_elements(
+    tensor: torch.Tensor,
+    patterns: list[IndexingPattern],
+    config: Config,
+) -> int | None:
+    """Element count of the VMEM-resident block for one tensor access.
+
+    Walks ``patterns`` alongside the tensor dims. Per-dim contribution:
+      - ``NonePattern``: skipped (broadcast axis, no tensor dim consumed).
+      - ``TilePattern`` / ``TileIndexWithOffsetPattern``: configured
+        ``block_size``, clamped to the full dim extent.
+      - ``TileBeginWithOffsetPattern`` / ``ArbitraryIndexPattern``: scalar
+        index, contributes 1.
+      - Anything else (full slice, indirect tensor index): the full dim
+        extent.
+
+    Returns ``None`` if any consumed dim is symbolic.
+    """
+    from ..compile_environment import CompileEnvironment
+
+    env = CompileEnvironment.current()
+    elements = 1
+    tdim = 0
+    for p in patterns:
+        if isinstance(p, NonePattern):
+            continue
+        dim_size = tensor.shape[tdim]
+        if not isinstance(dim_size, int):
+            # No support for dynamic shapes.
+            return None
+        if isinstance(p, (TilePattern, TileIndexWithOffsetPattern)):
+            bs = env.block_sizes[p.block_id].from_config(config)
+            if isinstance(bs, int):
+                dim_size = min(bs, dim_size)
+        elif isinstance(p, (TileBeginWithOffsetPattern, ArbitraryIndexPattern)):
+            dim_size = 1
+        elements *= dim_size
+        # Advance only on patterns that consume a tensor dim; NonePattern doesn't.
+        tdim += 1
+    return elements
+
+
+def _resolve_tensor_index_patterns(
+    node: torch.fx.Node,
+    tensor: torch.Tensor,
+    subscript: list[object],
+    patterns: list[IndexingPattern],
+    config: Config,
+) -> None:
+    """Replace TensorIndexPattern with IndirectGatherPattern for loads. Raise for stores."""
+    positions = [i for i, p in enumerate(patterns) if isinstance(p, TensorIndexPattern)]
+    if not positions:
+        return
+
+    from ...language import memory_ops
+
+    if node.target is not memory_ops.load:
+        op_name = getattr(node.target, "__name__", str(node.target))
+        raise NotImplementedError(
+            f"Pallas: indirect store (scatter) is not supported (op={op_name})."
+        )
+
+    from .gather import build_gather_plan
+
+    plan = build_gather_plan(tensor, subscript, positions, patterns, config)
+    for i in positions:
+        patterns[i] = IndirectGatherPattern(plan=plan)
 
 
 # Helper functions moved from memory_ops.py
