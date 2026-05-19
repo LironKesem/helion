@@ -8,6 +8,7 @@ $ python benchmarks/run.py [tritonbench args...] [--kernel <kernel_name(s)>]
 Example usage:
 $ python benchmarks/run.py --metrics speedup,accuracy --kernel vector_add  # Runs vector_add kernel
 $ python benchmarks/run.py --metrics speedup,accuracy --kernel vector_add,rms_norm  # Runs multiple kernels
+$ python benchmarks/run.py --helion-backend cute --metrics speedup,accuracy --kernel gemm  # Runs using the CuTe backend
 $ python benchmarks/run.py --metrics speedup,accuracy  # Runs all kernels
 
 # On GPU-1, run first 1/4 of inputs for all kernels and save results to CSV in the current directory
@@ -50,10 +51,12 @@ from helion._compat import get_device_name
 from helion._compile_time import enable as enable_compile_time
 from helion._compile_time import get_total_time as get_compile_total_time
 from helion._compile_time import reset as reset_compile_time
+from helion._compiler.backend_registry import list_backends
 from helion._testing import get_nvidia_gpu_model
 from helion._utils import counters
 from helion.autotuner.metrics import AutotuneMetrics
 from helion.autotuner.metrics import register_post_autotune_hook
+from helion.runtime.settings import _get_backend
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -98,8 +101,8 @@ def log_tensor_metadata(args: tuple[object, ...], kwargs: dict[str, object]) -> 
 
 # Maximum number of inputs to use
 MAX_NUM_INPUTS = 20
-MAMBA2_CHUNK_SCAN_LARGE_SHAPE = (64, 64, 1, 8192, 256, 64, 128)
-MAMBA2_CHUNK_SCAN_LARGE_SHAPE_MIN_FREE_MEMORY_BYTES = 100 * 1024**3
+MAMBA2_LARGE_SHAPE = (64, 64, 1, 8192, 256, 64, 128)
+MAMBA2_LARGE_SHAPE_MIN_FREE_MEMORY_BYTES = 100 * 1024**3
 
 # These patches mutate TritonBench operator classes, so remember patched classes
 # to avoid wrapping the same methods more than once in a long benchmark process.
@@ -156,20 +159,35 @@ def patch_mamba2_tritonbench_inputs(operator_name: str, Operator: type[Any]) -> 
                     x.shape[3],
                     C.shape[3],
                 )
-                if shape == MAMBA2_CHUNK_SCAN_LARGE_SHAPE and x.device.type == "cuda":
+                if shape == MAMBA2_LARGE_SHAPE and x.device.type == "cuda":
                     free_memory, _ = torch.cuda.mem_get_info(x.device)
                     # Accuracy checks run TritonBench's eager baseline, which
                     # expands cb across heads and OOMs below this free-memory level.
-                    if (
-                        free_memory
-                        < MAMBA2_CHUNK_SCAN_LARGE_SHAPE_MIN_FREE_MEMORY_BYTES
-                    ):
+                    if free_memory < MAMBA2_LARGE_SHAPE_MIN_FREE_MEMORY_BYTES:
                         continue
                 dt = torch.rand_like(dt)
                 dA_cumsum = _mamba_valid_dA_cumsum_like(dt)
                 yield cb, x, dt, dA_cumsum, C, prev_states, D
             else:
                 B, x, dt, _dA_cumsum = example_inputs
+                shape = (
+                    x.shape[0],
+                    x.shape[2],
+                    B.shape[2],
+                    x.shape[1],
+                    dt.shape[3],
+                    x.shape[3],
+                    B.shape[3],
+                )
+                if shape == MAMBA2_LARGE_SHAPE and x.device.type == "cuda":
+                    free_memory, _ = torch.cuda.mem_get_info(x.device)
+                    # Helion autotune for this shape consistently fails on H100
+                    # (~80 GB) after the 5 prior shapes have left behind cached
+                    # buffers and JIT state, even though the kernel + autotune
+                    # work on a freshly-cleared GPU. Gate on free memory so the
+                    # shape still runs on devices with >100 GB free (e.g. B200).
+                    if free_memory < MAMBA2_LARGE_SHAPE_MIN_FREE_MEMORY_BYTES:
+                        continue
                 dA_cumsum = _mamba_valid_dA_cumsum_like(dt)
                 yield B, x, dt, dA_cumsum
 
@@ -279,11 +297,13 @@ def patch_gdn_tritonbench_accuracy(operator_name: str, Operator: type[Any]) -> N
         if torch.isnan(output).any():
             return False
 
-        # FLA and Helion may use different bf16/float32 reduction orderings from
-        # the eager baseline for long GDN sequences. This tolerance keeps the
-        # benchmark focused on gross correctness while avoiding false dashboard
-        # failures from tiny relative errors near zero.
-        return torch.allclose(output, baseline_output, rtol=0.5, atol=2.0)
+        # bf16 reduction order vs the eager fp32 baseline drifts in this
+        # dot-heavy kernel. TritonBench's own GDN accuracy path used the
+        # smaller bf16 tolerance; batch>=16 needs the wider dashboard tolerance
+        # because the 16x longer accumulations drift further.
+        if output.shape[0] >= 16:
+            return torch.allclose(output, baseline_output, rtol=0.5, atol=2.0)
+        return torch.allclose(output, baseline_output, rtol=0.1, atol=0.3)
 
     Operator.accuracy = accuracy
     _PATCHED_GDN_OPERATOR_CLASSES.add(Operator)
@@ -377,17 +397,18 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {
     ),
     "rope": (
         "tritonbench.operators.rope.operator",
-        [
-            ("examples.rope", "rope_tritonbench"),
-            ("pretuned_kernels.rope.rope", "pretuned_rope_tritonbench"),
-        ],
+        "examples.rope",
+        "rope_tritonbench",
     ),
     "rope-bwd": (
         "tritonbench.operators.rope.operator",
-        [
-            ("examples.rope", "rope_tritonbench"),
-            ("pretuned_kernels.rope.rope", "pretuned_rope_tritonbench"),
-        ],
+        "examples.rope",
+        "rope_tritonbench",
+        {
+            # tritonbench's torch_compile rope-bwd recompiles during CUDA graph
+            # capture, causing "Offset increment outside graph capture" errors.
+            "remove_flags": ["--cudagraph"],
+        },
     ),
     "sum": ("tritonbench.operators.sum.operator", "examples.sum", "sum_tritonbench"),
     "softmax": (
@@ -556,6 +577,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {
         "tritonbench.operators.gdn_fwd_h.operator",
         "examples.gdn_fwd_h",
         "helion_gdn_fwd_h_tb",
+        {
+            # GDN is dot-heavy; compare all implementations against PyTorch's
+            # high-throughput CUDA matmul precision instead of strict fp32 einsums.
+            "precision": "tf32",
+        },
     ),
     "flex_attention": (
         "tritonbench.operators.flex_attention.operator",
@@ -665,9 +691,6 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "helion_rope_tritonbench-speedup": "helion_speedup",
         "helion_rope_tritonbench-accuracy": "helion_accuracy",
         "helion_rope_tritonbench-latency": "helion_latency_ms",
-        "helion_pretuned_rope_tritonbench-speedup": "helion_pretuned_speedup",
-        "helion_pretuned_rope_tritonbench-accuracy": "helion_pretuned_accuracy",
-        "helion_pretuned_rope_tritonbench-latency": "helion_pretuned_latency_ms",
     },
     "rope-bwd": {
         "apply_rotary_pos_emb": "baseline",
@@ -678,9 +701,6 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "helion_rope_tritonbench-speedup": "helion_speedup",
         "helion_rope_tritonbench-accuracy": "helion_accuracy",
         "helion_rope_tritonbench-latency": "helion_latency_ms",
-        "helion_pretuned_rope_tritonbench-speedup": "helion_pretuned_speedup",
-        "helion_pretuned_rope_tritonbench-accuracy": "helion_pretuned_accuracy",
-        "helion_pretuned_rope_tritonbench-latency": "helion_pretuned_latency_ms",
     },
     "cross_entropy": {
         "cross_entropy_loss": "baseline",
@@ -1787,6 +1807,7 @@ def write_results_to_json(
                         "name": "Helion Benchmark",
                         "extra_info": {
                             "device": result.device,
+                            "backend": _get_backend(),
                         },
                     },
                     "model": {
@@ -1928,6 +1949,12 @@ def main() -> None:
         help="Name(s) of the Helion kernel module(s) to run. Can be a single kernel or comma-separated list (e.g., vector_add or vector_add,rms_norm). If not specified, runs all kernels.",
     )
     parser.add_argument(
+        "--helion-backend",
+        choices=list_backends(),
+        default=None,
+        help="Helion code generation backend to benchmark. Defaults to HELION_BACKEND or triton.",
+    )
+    parser.add_argument(
         "--input-shard",
         type=str,
         help="Run only a subset of inputs for each kernel. Format: M/N where M is the shard number (1-indexed) and N is the total number of shards. For example, --input-shard 1/3 runs the first third of inputs for each kernel.",
@@ -1976,6 +2003,9 @@ def main() -> None:
 
     # Parse known args to get the kernel name, pass rest to tritonbench
     args, tritonbench_args = parser.parse_known_args()
+
+    if args.helion_backend:
+        os.environ["HELION_BACKEND"] = args.helion_backend
 
     # Add default tolerance values if not already specified
     if "--atol" not in tritonbench_args:

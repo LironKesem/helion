@@ -800,9 +800,18 @@ class TritonBackend(Backend):
         return "triton.jit"
 
     def function_decorator_for_args(self, args: Sequence[Argument]) -> str:
+        from .compile_environment import CompileEnvironment
         from .device_function import SymbolArgument
         from .device_function import TensorSizeArg
         from .device_function import TensorStrideArg
+
+        # Default to Triton's own behavior: let Triton specialize on values and
+        # alignment.  This enables vectorized loads (constexpr 1 for inner
+        # strides, divisibility-by-16 hint for sizes) at the cost of an
+        # occasional Triton recompile when a value crosses a specialization
+        # boundary (e.g. size 1 -> 2, alignment changes).
+        if not CompileEnvironment.current().settings.triton_do_not_specialize:
+            return self.function_decorator
 
         do_not_specialize = [
             arg.name
@@ -1036,6 +1045,11 @@ _TORCH_TO_JAX_DTYPE: dict[str, str] = {
     "torch.bool": "jnp.bool_",
     "torch.complex64": "jnp.complex64",
     "torch.complex128": "jnp.complex128",
+    "torch.float8_e4m3fn": "jnp.float8_e4m3fn",
+    "torch.float8_e4m3fnuz": "jnp.float8_e4m3fnuz",
+    "torch.float8_e5m2": "jnp.float8_e5m2",
+    "torch.float8_e5m2fnuz": "jnp.float8_e5m2fnuz",
+    "torch.float8_e8m0fnu": "jnp.float8_e8m0fnu",
 }
 
 
@@ -2560,6 +2574,11 @@ class CuteBackend(Backend):
             inductor_dtype := CuteDSLOpOverrides.TORCH_TO_CUTE_DTYPE.get(dtype)
         ) is not None:
             return inductor_dtype
+        if dtype is torch.float4_e2m1fn_x2:
+            # PyTorch's shell dtype stores two E2M1 values in one byte.  CuTe
+            # does not support scalar dereference for its 4-bit type yet, so
+            # SIMT scalar loads treat the tensor as raw byte storage.
+            return "cutlass.Uint8"
         if dtype is torch.uint64:
             return "cutlass.Int64"
 
@@ -2651,6 +2670,9 @@ class CuteBackend(Backend):
             "_cute_grouped_reduce_warp": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_warp",
             "_cute_store_shared_remote_x4": "from helion._compiler.cute.cluster_helpers import store_shared_remote_x4 as _cute_store_shared_remote_x4",
             "_cute_issue_clc_query_nomulticast": "from helion._compiler.cute.clc_helpers import issue_clc_query_nomulticast as _cute_issue_clc_query_nomulticast",
+            "_cute_inline_asm_elementwise": "from helion._compiler.cute.inline_asm_helpers import inline_asm_elementwise as _cute_inline_asm_elementwise",
+            "_cute_fp8e4m3fn_to_float32": "from helion._compiler.cute.quantized_helpers import fp8e4m3fn_to_float32 as _cute_fp8e4m3fn_to_float32",
+            "_cute_float4_e2m1fn_x2_to_float32": "from helion._compiler.cute.quantized_helpers import float4_e2m1fn_x2_to_float32 as _cute_float4_e2m1fn_x2_to_float32",
         }
 
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:
